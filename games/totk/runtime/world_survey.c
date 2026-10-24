@@ -171,23 +171,243 @@ int runtime_survey_command(const char *line) {
 }
 #endif   /* GAME_BOTW160 */
 #if defined(GAME_BOTW190)
-/* 1.9.0: no Havok/matrix chains yet; telemetry reads VFR (main+0x1e93890) and the ultrawide camera singleton
-   (main+0x1e39d10, views +0x28/+0x118, projection +0x38) with mach_vm_read_overwrite. Tick runs from present. */
+/* 1.9.0: telemetry reads VFR (main+0x1e93890), the ultrawide camera singleton
+   (main+0x1e39d10, views +0x28/+0x118, projection +0x38), PlayerMgr::sInstance (main+0x1e13ed0),
+   and BaseProcMgr::sInstance active actor tree (main+0x1e937f8) with mach_vm_read_overwrite, plus
+   the GPU-staged 8x8 scene depth grid via mtl_bot_depth_grid. Tick runs from present. */
 enum { VFR_INSTANCE = 0x1e93890, VFR_RATIO = 0x3c, VFR_DELTA_TIME = 0x138,
-       CAMERA_SINGLETON = 0x1e39d10, CAMERA_VIEW0 = 0x28, CAMERA_VIEW1 = 0x118, CAMERA_PROJ = 0x38 };
+       CAMERA_SINGLETON = 0x1e39d10, CAMERA_VIEW0 = 0x28, CAMERA_VIEW1 = 0x118, CAMERA_PROJ = 0x38,
+       PLAYER_MGR = 0x1e13ed0, BASE_PROC_MGR = 0x1e937f8 };
 static uintptr_t survey_main_190;
 static _Atomic int survey_enabled_190;
+static int valid_guest_range_190(uintptr_t address, size_t size, int require_align8) {
+    if (!address || address < 0x100000000ULL || address > 0x8000000000ULL - size) return 0;
+    if (require_align8 && (address & 7ULL) != 0) return 0;
+    return 1;
+}
 static int read_mem_190(uintptr_t address, void *out, size_t size) {
-    if (!address || address > UINTPTR_MAX - size) return 0;
+    if (!valid_guest_range_190(address, size, 0)) return 0;
     mach_vm_size_t got = 0;
     return mach_vm_read_overwrite(mach_task_self(), address, size, (uintptr_t)out, &got) == KERN_SUCCESS && got == size;
 }
-static uintptr_t read_ptr_190(uintptr_t address) { uintptr_t p = 0; return read_mem_190(address, &p, sizeof p) ? p : 0; }
+static uintptr_t read_ptr_190(uintptr_t address) {
+    if (!valid_guest_range_190(address, sizeof(uintptr_t), 1)) return 0;
+    uintptr_t p = 0;
+    return read_mem_190(address, &p, sizeof p) ? p : 0;
+}
+static int valid_xyz_190(const float xyz[3]) {
+    return isfinite(xyz[0]) && isfinite(xyz[1]) && isfinite(xyz[2]) &&
+           fabsf(xyz[0]) <= 8000.0f && xyz[1] >= -1000.0f && xyz[1] <= 4000.0f && fabsf(xyz[2]) <= 8000.0f;
+}
+static int non_zero_xyz_190(const float xyz[3]) {
+    return fabsf(xyz[0]) > 0.05f || fabsf(xyz[1]) > 0.05f || fabsf(xyz[2]) > 0.05f;
+}
+static float dist3_190(const float a[3], const float b[3]) {
+    float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+    return sqrtf(dx * dx + dy * dy + dz * dz);
+}
+static uint32_t fnv1a_ascii_190(const char *str, size_t max_len, char out_name[48]) {
+    if (out_name) out_name[0] = '\0';
+    if (!str) return 0;
+    unsigned char c0 = (unsigned char)str[0];
+    if (!((c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z') || c0 == '_')) return 0;
+    uint32_t h = 0x811c9dc5u;
+    size_t i = 0;
+    for (; i < max_len && str[i]; i++) {
+        unsigned char c = (unsigned char)str[i];
+        if (c < 0x20 || c > 0x7e) return 0;
+        h ^= (uint32_t)c;
+        h *= 0x01000193u;
+        if (out_name && i < 47) out_name[i] = (char)c;
+    }
+    if (out_name) out_name[i < 47 ? i : 47] = '\0';
+    return i >= 2 ? h : 0;
+}
+
+/* BotW 1.9.0 ksys::act::BaseProcMgr RB-tree node embedded at BaseProc + 0x118 (0x15149f4, 0x151889c..0x15189d4):
+   - In 0x151889c (`ldr x8, [x19, #0x8]!`), x19 advances to BaseProc + 0x08 before `add x22, x19, #0x110`,
+     so the RB-tree node is at BaseProc + 0x118 (confirmed by `add x20, x1, #0x118` in 0x15189d4 and
+     `stp x19, xzr, [x19, #0x150]` in BaseProc ctor 0x1514a08 storing `BaseProc*` at node + 0x38).
+   - bpm + 0x98 is an inline TreeMap whose +0x00 is the root node_addr (BaseProc + 0x118).
+   - node + 0x08 / +0x10: left / right child node_addr (BaseProc + 0x120 / +0x128).
+   - node + 0x20: name_crc32 (BaseProc + 0x138).
+   - node + 0x30: name_cstr_ptr inside sead::SafeString (BaseProc + 0x148).
+   - node + 0x38: self BaseProc* pointer (BaseProc + 0x150).
+   - node + 0x48: next_same_name_node (BaseProc + 0x160), chaining duplicate-named BaseProcs.
+   - Actor world matrix sead::Matrix34f mMtx is at BaseProc + 0x398 (translation at m[3], m[7], m[11] = +0x3a4, +0x3b4, +0x3c4)
+     and linear velocity sead::Vector3f mLinearVel is at BaseProc + 0x400 (+0x400..+0x40c). */
+typedef struct {
+    uint64_t hdr;
+    uint64_t left;
+    uint64_t right;
+    uint64_t parent_color;
+    uint32_t name_crc32;
+    uint32_t pad0;
+    uint64_t safe_str_vtbl;
+    uint64_t name_cstr_ptr;
+    uint64_t field_38;
+    uint64_t prev_same_name_node;
+    uint64_t next_same_name_node;
+} BaseProcMapNode190;
+
 #if TARGET_OS_OSX
 extern void runtime_input_pad_synthetic(const RuntimeGamepadState *s) __attribute__((weak_import));
 extern void dm_gfx_ashot(const char *path) __attribute__((weak_import));
 extern void runtime_front_request_close(void) __attribute__((weak_import));
+extern int mtl_bot_depth_grid(float out_grid[64], uint32_t *out_wb_staged);
+
+enum {
+    HASH_GAME_ROM_PLAYER = 0x0c342f65u, /* FNV-1a-32("GameRomPlayer") */
+    HASH_PLAYER_STOLE2   = 0x3e62889bu, /* FNV-1a-32("PlayerStole2") */
+};
+
+static int ptr_seen_add_190(uintptr_t *set, int *count, int cap, uintptr_t val) {
+    for (int i = 0; i < *count; i++) {
+        if (set[i] == val) return 1;
+    }
+    if (*count >= cap) return 1;
+    set[(*count)++] = val;
+    return 0;
+}
+
+static uint32_t survey_collect_actors_190(
+    uintptr_t main_base,
+    uintptr_t player_actor,
+    const float player_pos[3],
+    BotActorSlot out_slots[BOT_ACTOR_SLOTS],
+    char out_top_names[3][48],
+    int *out_tree_ok
+) {
+    if (out_tree_ok) *out_tree_ok = 0;
+    for (int i = 0; i < 3; i++) out_top_names[i][0] = '\0';
+    if (!valid_xyz_190(player_pos) || !non_zero_xyz_190(player_pos)) return 0;
+    uintptr_t bpm = read_ptr_190(main_base + BASE_PROC_MGR);
+    uintptr_t root = bpm ? read_ptr_190(bpm + 0x98ULL) : 0;
+    if (!valid_guest_range_190(root, sizeof(BaseProcMapNode190), 1) || root <= 0x118ULL) return 0;
+    if (out_tree_ok) *out_tree_ok = 1;
+
+    uintptr_t stack[64];
+    uintptr_t seen_nodes[256];
+    uintptr_t seen_procs[256];
+    int n_seen_nodes = 0;
+    int n_seen_procs = 0;
+    int sp = 0;
+    stack[sp++] = root;
+    int visited = 0;
+    uint32_t total_count = 0;
+    uint32_t filled = 0;
+
+    while (sp > 0 && visited < 256) {
+        uintptr_t node_addr = stack[--sp];
+        if (!valid_guest_range_190(node_addr, sizeof(BaseProcMapNode190), 1) || node_addr <= 0x118ULL) continue;
+        if (ptr_seen_add_190(seen_nodes, &n_seen_nodes, 256, node_addr)) continue;
+        visited++;
+        BaseProcMapNode190 node;
+        if (!read_mem_190(node_addr, &node, sizeof(node))) continue;
+        if (valid_guest_range_190(node.right, sizeof(BaseProcMapNode190), 1) && sp < 64) stack[sp++] = node.right;
+        if (valid_guest_range_190(node.left, sizeof(BaseProcMapNode190), 1) && sp < 64) stack[sp++] = node.left;
+
+        char raw_name[48] = {0};
+        char clean_name[48] = {0};
+        uint32_t name_hash = 0;
+        if (node.name_cstr_ptr && read_mem_190(node.name_cstr_ptr, raw_name, sizeof(raw_name) - 1)) {
+            raw_name[sizeof(raw_name) - 1] = '\0';
+            name_hash = fnv1a_ascii_190(raw_name, sizeof(raw_name) - 1, clean_name);
+        }
+        if (!name_hash) {
+            uintptr_t proc0 = node_addr - 0x118ULL;
+            uintptr_t alt_cstr = read_ptr_190(proc0 + 0x10ULL);
+            if (alt_cstr && read_mem_190(alt_cstr, raw_name, sizeof(raw_name) - 1)) {
+                raw_name[sizeof(raw_name) - 1] = '\0';
+                name_hash = fnv1a_ascii_190(raw_name, sizeof(raw_name) - 1, clean_name);
+            }
+        }
+        if (!name_hash) {
+            name_hash = node.name_crc32;
+            snprintf(clean_name, sizeof(clean_name), "0x%08x", name_hash);
+        }
+
+        int is_player_name = (name_hash == HASH_GAME_ROM_PLAYER || name_hash == HASH_PLAYER_STOLE2 ||
+                              strcmp(clean_name, "GameRomPlayer") == 0 || strcmp(clean_name, "PlayerStole2") == 0);
+
+        uintptr_t cur_node = node_addr;
+        for (int chain = 0; chain < 8; chain++) {
+            if (!valid_guest_range_190(cur_node, sizeof(BaseProcMapNode190), 1) || cur_node <= 0x118ULL) break;
+            if (chain > 0 && ptr_seen_add_190(seen_nodes, &n_seen_nodes, 256, cur_node)) break;
+            uintptr_t proc = cur_node - 0x118ULL;
+            uintptr_t next_node = (chain == 0) ? node.next_same_name_node : read_ptr_190(cur_node + 0x48ULL);
+            if (valid_guest_range_190(proc, 0x40cULL, 1) &&
+                proc != player_actor && !is_player_name &&
+                !ptr_seen_add_190(seen_procs, &n_seen_procs, 256, proc)) {
+                /* BaseProc + 0x24 is mState (u8) and BaseProc + 0x28 is mFlags (u32). */
+                uint8_t state_blk[8] = {0};
+                uint32_t proc_flags = 0;
+                if (read_mem_190(proc + 0x24ULL, state_blk, sizeof(state_blk))) {
+                    uint8_t m_state = state_blk[0];
+                    uint32_t m_flags = 0;
+                    memcpy(&m_flags, &state_blk[4], sizeof(m_flags));
+                    proc_flags = ((uint32_t)m_state << 24) | (m_flags & 0x00ffffffu);
+                }
+                /* Read 29 floats (116 bytes) at proc + 0x398:
+                   - blk[0..11]  (0x398..0x3c8): sead::Matrix34f mMtx, world pos = (blk[3], blk[7], blk[11])
+                   - blk[26..28] (0x400..0x40c): sead::Vector3f mLinearVel */
+                float blk[29];
+                if (read_mem_190(proc + 0x398ULL, blk, sizeof(blk))) {
+                    float pos_mtx[3] = {blk[3], blk[7], blk[11]};
+                    if (valid_xyz_190(pos_mtx) && non_zero_xyz_190(pos_mtx)) {
+                        float d = dist3_190(pos_mtx, player_pos);
+                        if (d >= 0.05f && d <= 500.0f) {
+                            const float *vel_400 = &blk[26];
+                            BotActorSlot cand = {0};
+                            cand.name_hash = name_hash;
+                            cand.flags = proc_flags;
+                            cand.pos = (BotVec3){pos_mtx[0], pos_mtx[1], pos_mtx[2]};
+                            if (isfinite(vel_400[0]) && isfinite(vel_400[1]) && isfinite(vel_400[2]) &&
+                                fabsf(vel_400[0]) < 500.0f && fabsf(vel_400[1]) < 500.0f && fabsf(vel_400[2]) < 500.0f) {
+                                cand.vel = (BotVec3){vel_400[0], vel_400[1], vel_400[2]};
+                            }
+                            cand.dist_m = d;
+                            total_count++;
+
+                            int dup_slot = 0;
+                            for (uint32_t i = 0; i < filled; i++) {
+                                float slot_pos[3] = {out_slots[i].pos.x, out_slots[i].pos.y, out_slots[i].pos.z};
+                                if (out_slots[i].name_hash == cand.name_hash && dist3_190(slot_pos, pos_mtx) < 0.01f) {
+                                    dup_slot = 1;
+                                    break;
+                                }
+                            }
+                            if (!dup_slot) {
+                                uint32_t ins = filled;
+                                for (uint32_t i = 0; i < filled; i++) {
+                                    if (d < out_slots[i].dist_m) {
+                                        ins = i;
+                                        break;
+                                    }
+                                }
+                                if (ins < BOT_ACTOR_SLOTS) {
+                                    uint32_t lim = filled < (BOT_ACTOR_SLOTS - 1) ? filled : (BOT_ACTOR_SLOTS - 1);
+                                    for (uint32_t j = lim; j > ins; j--) {
+                                        out_slots[j] = out_slots[j - 1];
+                                        if (j < 3) memcpy(out_top_names[j], out_top_names[j - 1], 48);
+                                    }
+                                    out_slots[ins] = cand;
+                                    if (ins < 3) memcpy(out_top_names[ins], clean_name, 48);
+                                    if (filled < BOT_ACTOR_SLOTS) filled++;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (!next_node || next_node == cur_node) break;
+            cur_node = next_node;
+        }
+    }
+    return total_count;
+}
 #endif
+
 void runtime_survey_init(Module *m) {
     const char *enabled = getenv("TOTK_SURVEY");
     const char *smoke = getenv("TOTK_BOT_SMOKE");
@@ -199,7 +419,7 @@ void runtime_survey_init(Module *m) {
         runtime_fail("survey: Breath of the Wild 1.9.0 main expected");
     survey_main_190 = (uintptr_t)m->base;
     atomic_store(&survey_enabled_190, 1);
-    fprintf(stderr, "[survey] enabled (Breath of the Wild 1.9.0): VFR and camera telemetry on present\n");
+    fprintf(stderr, "[survey] enabled (Breath of the Wild 1.9.0): VFR, camera, PlayerMgr, BaseProcMgr actors, and GPU 8x8 depth telemetry on present\n");
 }
 void runtime_survey_tick(uint64_t frame) {
     if (!atomic_load_explicit(&survey_enabled_190, memory_order_relaxed) || !survey_main_190) return;
@@ -213,12 +433,17 @@ void runtime_survey_tick(uint64_t frame) {
     uintptr_t cam = read_ptr_190(survey_main_190 + CAMERA_SINGLETON);
     uintptr_t view0 = cam ? cam + CAMERA_VIEW0 : 0, view1 = cam ? cam + CAMERA_VIEW1 : 0;
     uintptr_t proj = cam ? cam + CAMERA_PROJ : 0;
-    float aspect = 0, fovy = 0; uint64_t proj_vt = 0;
+    float near_clip = 1.0f, far_clip = 25000.0f, aspect = 0, fovy = 0; uint64_t proj_vt = 0;
     if (proj) {
         read_mem_190(proj, &proj_vt, sizeof proj_vt);
+        read_mem_190(proj + 0x98, &near_clip, sizeof near_clip);
+        read_mem_190(proj + 0x9c, &far_clip, sizeof far_clip);
         read_mem_190(proj + 0xa0, &fovy, sizeof fovy);
         read_mem_190(proj + 0xb0, &aspect, sizeof aspect);
     }
+    if (!isfinite(near_clip) || near_clip <= 0.001f || near_clip > 100.0f) near_clip = 1.0f;
+    if (!isfinite(far_clip) || far_clip <= near_clip || far_clip > 100000.0f) far_clip = 25000.0f;
+
     float cpos[3] = {0}, cat[3] = {0}, cup[3] = {0, 1, 0}, cfwd[3] = {0, 0, 1};
     uintptr_t active_cam = 0;
     if (view0) {
@@ -234,60 +459,135 @@ void runtime_survey_tick(uint64_t frame) {
             if (len > 1e-5f) { cfwd[0] = dx / len; cfwd[1] = dy / len; cfwd[2] = dz / len; }
         }
     }
+
+    uintptr_t pmgr = read_ptr_190(survey_main_190 + PLAYER_MGR);
+    uintptr_t player_actor = pmgr ? read_ptr_190(pmgr + 0x60ULL) : 0;
+    float ppos[3] = {cat[0], cat[1], cat[2]};
+    float pfwd[3] = {cfwd[0], cfwd[1], cfwd[2]};
+    int player_pos_resolved = 0;
+    if (player_actor) {
+        float pmtx[12];
+        if (read_mem_190(player_actor + 0x398ULL, pmtx, sizeof(pmtx))) {
+            float cand_mtx[3] = {pmtx[3], pmtx[7], pmtx[11]};
+            if (valid_xyz_190(cand_mtx) && non_zero_xyz_190(cand_mtx) &&
+                (!active_cam || !non_zero_xyz_190(cat) || dist3_190(cand_mtx, cat) < 25.0f)) {
+                memcpy(ppos, cand_mtx, sizeof(ppos));
+                player_pos_resolved = 1;
+                /* Extract Link's forward basis column (col 2 of row-major 3x4 mMtx: pmtx[2], pmtx[6], pmtx[10]). */
+                float fx = pmtx[2], fy = pmtx[6], fz = pmtx[10];
+                if (isfinite(fx) && isfinite(fy) && isfinite(fz)) {
+                    float flen = sqrtf(fx * fx + fy * fy + fz * fz);
+                    if (flen > 1e-4f) {
+                        pfwd[0] = fx / flen;
+                        pfwd[1] = fy / flen;
+                        pfwd[2] = fz / flen;
+                    }
+                }
+            }
+        }
+    }
+
     extern void mtl_stats(uint64_t *passes, uint64_t *draws);
     static uint64_t prev_draws_190;
     uint64_t passes_190 = 0, draws_190 = 0;
     mtl_stats(&passes_190, &draws_190);
     uint32_t this_draws_190 = draws_190 >= prev_draws_190 ? (uint32_t)(draws_190 - prev_draws_190) : 0;
     prev_draws_190 = draws_190;
-    if (frame == 1 || frame % 300 == 0)
-        fprintf(stderr, "[survey] frame=%llu vfr=%#llx ratio=%.4f delta=%.5f cam=%#llx view0=%#llx view1=%#llx proj=%#llx aspect=%.4f fovy=%.4f pos=%.2f,%.2f,%.2f at=%.2f,%.2f,%.2f draws=%u\n",
+    (void)proj_vt;
+
+#if TARGET_OS_OSX
+    uint32_t wb_staged = 0;
+    float depth_grid[BOT_DEPTH_GRID_CELLS] = {0};
+    int depth_ok = mtl_bot_depth_grid(depth_grid, &wb_staged);
+    BotActorSlot actors[BOT_ACTOR_SLOTS];
+    memset(actors, 0, sizeof(actors));
+    char top_names[3][48] = {{0}};
+    int actors_tree_ok = 0;
+    uint32_t actor_count = 0;
+    if ((player_pos_resolved || this_draws_190 >= 400) && non_zero_xyz_190(ppos)) {
+        actor_count = survey_collect_actors_190(survey_main_190, player_actor, ppos, actors, top_names, &actors_tree_ok);
+    }
+
+    if (frame == 1 || frame % 300 == 0) {
+        fprintf(stderr,
+                "[survey] frame=%llu vfr=%#llx ratio=%.4f delta=%.5f cam=%#llx view0=%#llx view1=%#llx proj=%#llx "
+                "aspect=%.4f fovy=%.4f near=%.2f far=%.1f pos=%.2f,%.2f,%.2f at=%.2f,%.2f,%.2f player=%.2f,%.2f,%.2f "
+                "draws=%u depth_valid=%d d_center=%.5f d_ground=%.5f wb=%u actors=%u top0=%s(%.1fm) top1=%s(%.1fm)\n",
                 (unsigned long long)frame, (unsigned long long)vfr, ratio, delta,
                 (unsigned long long)cam, (unsigned long long)view0, (unsigned long long)view1,
-                (unsigned long long)proj, aspect, fovy, cpos[0], cpos[1], cpos[2], cat[0], cat[1], cat[2], this_draws_190);
-    (void)proj_vt;
-#if TARGET_OS_OSX
+                (unsigned long long)proj, aspect, fovy, near_clip, far_clip,
+                cpos[0], cpos[1], cpos[2], cat[0], cat[1], cat[2], ppos[0], ppos[1], ppos[2],
+                this_draws_190, depth_ok, depth_grid[3 * 8 + 3], depth_grid[6 * 8 + 3], wb_staged,
+                actor_count,
+                top_names[0][0] ? top_names[0] : "none", actors[0].dist_m,
+                top_names[1][0] ? top_names[1] : "none", actors[1].dist_m);
+    }
+
     if (bot_on_frame_tick) {
+        static int prev_bot_pad_connected = 0;
+        uint32_t flags = 0;
+        if ((this_draws_190 >= 400 || depth_ok) && player_pos_resolved) flags |= BOT_STATE_WORLD_READY;
+        if (depth_ok) flags |= BOT_STATE_DEPTH_VALID;
+        if (player_pos_resolved) flags |= BOT_STATE_PLAYER_VALID;
+        if (actors_tree_ok) flags |= BOT_STATE_ACTORS_VALID;
+
         SchematicState st = {
             .abi_version = BOT_ABI_VERSION,
-            .state_flags = this_draws_190 >= 400 ? 1u : 0u,
+            .state_flags = flags,
             .frame_index = frame,
             .now_ns = runtime_now_ns(),
             .vfr_dt_s = delta > 0 ? delta : (ratio > 0 ? ratio / 30.0f : 0),
             .this_frame_draws = this_draws_190,
-            .player_pos = {cat[0], cat[1], cat[2]},
-            .player_fwd = {cfwd[0], cfwd[1], cfwd[2]},
+            .wb_stage_count = wb_staged,
+            .player_pos = {ppos[0], ppos[1], ppos[2]},
+            .player_fwd = {pfwd[0], pfwd[1], pfwd[2]},
             .camera_pos = {cpos[0], cpos[1], cpos[2]},
             .camera_fwd = {cfwd[0], cfwd[1], cfwd[2]},
             .camera_up = {cup[0], cup[1], cup[2]},
             .camera_fovy = fovy,
+            .camera_near = near_clip,
+            .camera_far = far_clip,
+            .actor_count = actor_count,
         };
+        memcpy(st.depth_grid, depth_grid, sizeof(st.depth_grid));
+        memcpy(st.actors, actors, sizeof(st.actors));
+
         BotFrameCommand cmd = {0};
-        static int prev_bot_pad_connected = 0;
         bot_on_frame_tick(&st, &cmd);
-        if (runtime_input_pad_synthetic) {
-            if (cmd.pad_connected) {
+        if (cmd.pad_connected) {
+            if (runtime_input_pad_synthetic) {
                 RuntimeGamepadState pad = {.buttons = cmd.buttons, .lx = cmd.lx, .ly = cmd.ly, .rx = cmd.rx, .ry = cmd.ry, .connected = 1};
                 runtime_input_pad_synthetic(&pad);
-                prev_bot_pad_connected = 1;
-            } else if (prev_bot_pad_connected) {
-                runtime_input_pad_synthetic(NULL);
-                prev_bot_pad_connected = 0;
             }
+            prev_bot_pad_connected = 1;
+        } else if (prev_bot_pad_connected) {
+            if (runtime_input_pad_synthetic) {
+                runtime_input_pad_synthetic(NULL);
+            }
+            prev_bot_pad_connected = 0;
         }
         if (cmd.pin_frame_step_us) runtime_frame_step_pin(cmd.pin_frame_step_us / 1000.0);
-        if (cmd.request_ashot_id && cmd.ashot_path[0] && dm_gfx_ashot) {
-            dm_gfx_ashot(cmd.ashot_path);
+        if (cmd.request_ashot_id && dm_gfx_ashot) {
+            cmd.ashot_path[BOT_ASHOT_PATH_MAX - 1] = '\0';
+            if (cmd.ashot_path[0]) {
+                dm_gfx_ashot(cmd.ashot_path);
+            }
         }
         if (cmd.request_close && runtime_front_request_close) {
             runtime_front_request_close();
         }
     }
+#else
+    if (frame == 1 || frame % 300 == 0)
+        fprintf(stderr, "[survey] frame=%llu vfr=%#llx ratio=%.4f delta=%.5f cam=%#llx view0=%#llx view1=%#llx proj=%#llx aspect=%.4f fovy=%.4f pos=%.2f,%.2f,%.2f at=%.2f,%.2f,%.2f draws=%u\n",
+                (unsigned long long)frame, (unsigned long long)vfr, ratio, delta,
+                (unsigned long long)cam, (unsigned long long)view0, (unsigned long long)view1,
+                (unsigned long long)proj, aspect, fovy, cpos[0], cpos[1], cpos[2], cat[0], cat[1], cat[2], this_draws_190);
 #endif
 }
 int runtime_survey_command(const char *line) {
     if (strncmp(line, "survey ", 7)) return 0;
-    fprintf(stderr, "[survey] Breath of the Wild 1.9.0: telemetry only (no pos/move chains yet)\n");
+    fprintf(stderr, "[survey] Breath of the Wild 1.9.0: VFR, camera, PlayerMgr, BaseProcMgr actors, and GPU 8x8 depth telemetry active on present\n");
     return 1;
 }
 #endif   /* GAME_BOTW190 */

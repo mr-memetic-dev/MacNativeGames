@@ -237,6 +237,15 @@ void botw_tiny_note(const void *t, const void *o);
 #define BOTW_TINY_NOTE(t, o) botw_tiny_note((t), (__bridge const void *)(o));
 void botw_tiny_commit(void);
 #define BOTW_TINY_COMMIT() botw_tiny_commit();
+#ifdef GAME_BOTW190
+void botw_depth_sub_begin(void);
+void botw_depth_note(const void *pd);
+#define BOTW_DEPTH_SUB_BEGIN() botw_depth_sub_begin();
+#define BOTW_DEPTH_NOTE(pd) botw_depth_note((__bridge const void *)(pd));
+#else
+#define BOTW_DEPTH_SUB_BEGIN()
+#define BOTW_DEPTH_NOTE(pd)
+#endif
 #else
 #define MFX_CANVAS_FMT_OK(f) pf_is_float(f)
 #define MFX_UI_DRAW(pr) mfx_ui_vs(pr->sh[0]->key)
@@ -272,6 +281,8 @@ int totk_wb_fence_on(void);
 #define BOTW_WB_FROM_STAGE(e, ok, layers)
 #define BOTW_TINY_NOTE(t, o)
 #define BOTW_TINY_COMMIT()
+#define BOTW_DEPTH_SUB_BEGIN()
+#define BOTW_DEPTH_NOTE(pd)
 #define UNCAPPED_INTERVAL_FROM_ENV(e) e && atoi(e)
 #define BOTW_RT_DUP_CLEARS()
 #define BOTW_RT_DUP_SKIP(i)
@@ -377,3 +388,4 @@ void mtl_prog_prefetch(const prog_t *p);   // TOTK_SHADER_PREFETCH=1: start comp
 // 新序号（> 0，全局递增）
 // New serial (> 0, globally increasing)
 uint64_t nvn_new_serial(void);
+int mtl_bot_depth_grid(float out_grid[64], uint32_t *out_wb_staged);
