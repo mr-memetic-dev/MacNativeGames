@@ -1152,6 +1152,7 @@ void mtl_sub_begin(void) {
     g_nshadow = 0;
     g_npost = 0; g_vis = nil; g_vis_n = 0; g_vis_cur = -1; pend_begin();
     zskip_clear(); g_zskip_count = 0;
+    BOTW_DEPTH_SUB_BEGIN()
     int pick = -1;
     for (int i = 0; i < g_vis_ring_n; i++) if (g_vis_ring[i].fence <= g_done) { pick = i; break; }
     if (pick < 0 && g_vis_ring_n < 4) pick = g_vis_ring_n++;
@@ -5051,6 +5052,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     if (taa_pass(pd) == 2) g_mfx.want_cam = 1;   // TOTK_TAA: the G-buffer pass found; its first draw gives the camera
     if (mfx_enabled()) mfx_pass_setup(pd);   // TOTK: MetalFX scene / UI attachments, G-buffer depth
     else if (uw_ratio()) canvas_learn(pd);   // key 4: the canvas the UI is squeezed in
+    BOTW_DEPTH_NOTE(pd);
     g_enc = enc_r_begin(pd);
     args_dirty_all();
     g_stat_pass++;
@@ -17407,6 +17409,184 @@ static int wb_stageable(const tex_t *t, size_t *total) {
     *total = n;
     return n && n <= WB_STAGE_MAX;
 }
+
+#ifdef GAME_BOTW190
+/* Zero-stall 8x8 G-buffer depth grid staging for the Rust bot FFI (SchematicState.depth_grid).
+   Active only when TOTK_SURVEY=1 or TOTK_BOT_SMOKE=1. Notes the submission's primary 16:9 3D scene / G-buffer depth
+   attachment in rp_begin_ex (preferring the first highest-nc G-buffer pass), copies 64 evenly-spaced 1x1 depth samples
+   into an 8-slot shared ring buffer at submission end (botw_wb_stage_encode), and lets runtime_survey_tick read the
+   most recent GPU-completed G-buffer slot (fence <= g_done) with zero GPU wait. */
+#define BOT_DEPTH_SLOTS 8
+static struct {
+    id<MTLBuffer> buf;
+    uint64_t fence;
+    uint32_t w, h;
+    int nc;
+} g_bot_depth_ring[BOT_DEPTH_SLOTS];
+static unsigned g_bot_depth_wr;
+static __strong id<MTLTexture> g_bot_depth_sub_tex;
+static int g_bot_depth_sub_nc;
+
+static inline int botw_depth_stage_active(void) {
+    static int s_active = -1;
+    int v = __atomic_load_n(&s_active, __ATOMIC_RELAXED);
+    if (__builtin_expect(v < 0, 0)) {
+        const char *sv = getenv("TOTK_SURVEY");
+        const char *sm = getenv("TOTK_BOT_SMOKE");
+        v = ((sv && strcmp(sv, "1") == 0) || (sm && strcmp(sm, "1") == 0)) ? 1 : 0;
+        __atomic_store_n(&s_active, v, __ATOMIC_RELAXED);
+    }
+    return v;
+}
+
+void botw_depth_sub_begin(void) {
+    g_bot_depth_sub_tex = nil;
+    g_bot_depth_sub_nc = 0;
+}
+
+void botw_depth_note(const void *pd_ptr) {
+    if (__builtin_expect(!botw_depth_stage_active(), 1) || !pd_ptr) return;
+    MTL4RenderPassDescriptor *pd = (__bridge MTL4RenderPassDescriptor *)pd_ptr;
+    id<MTLTexture> c0 = pd.colorAttachments[0].texture, dt = pd.depthAttachment.texture;
+    if (!dt || !c0 || dt.textureType != MTLTextureType2D || pd.depthAttachment.level != 0 || pd.depthAttachment.slice != 0)
+        return;
+    MTLPixelFormat pf = dt.pixelFormat;
+    if (pf != MTLPixelFormatDepth32Float && pf != MTLPixelFormatDepth32Float_Stencil8)
+        return;
+    if (dt.width != c0.width || dt.height != c0.height || dt.width < 640 || dt.width <= dt.height)
+        return;
+    int nc = 0;
+    for (int i = 0; i < 8; i++) nc += pd.colorAttachments[i].texture != nil;
+    /* Only upgrade when nc > g_bot_depth_sub_nc so the first G-buffer pass (nc >= 3..4) is never overwritten by
+       later lighting/water/UI passes with fewer or equal color attachments in the same submission. */
+    if (nc > g_bot_depth_sub_nc) {
+        g_bot_depth_sub_tex = dt;
+        g_bot_depth_sub_nc = nc;
+    }
+}
+
+static void botw_depth_stage_encode(uint64_t fence) {
+    id<MTLTexture> dtex = g_bot_depth_sub_tex;
+    int sub_nc = g_bot_depth_sub_nc;
+    g_bot_depth_sub_tex = nil;
+    g_bot_depth_sub_nc = 0;
+    if (__builtin_expect(!botw_depth_stage_active(), 1)) return;
+    if (!dtex || sub_nc <= 0 || dtex.width < 8 || dtex.height < 8) return;
+    uint64_t done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
+    /* Find the slot that mtl_bot_depth_grid would currently pick as the best completed slot so we never overwrite it. */
+    int best_done_slot = -1;
+    uint64_t best_done_fence = 0;
+    int best_done_ge3 = 0;
+    for (int i = 0; i < BOT_DEPTH_SLOTS; i++) {
+        uint64_t f = __atomic_load_n(&g_bot_depth_ring[i].fence, __ATOMIC_ACQUIRE);
+        if (f == 0 || f == UINT64_MAX || f > done || g_bot_depth_ring[i].buf == nil) continue;
+        int nc_i = __atomic_load_n(&g_bot_depth_ring[i].nc, __ATOMIC_ACQUIRE);
+        int ge3 = (nc_i >= 3);
+        if (best_done_slot < 0 || (ge3 > best_done_ge3) || (ge3 == best_done_ge3 && f > best_done_fence)) {
+            best_done_fence = f;
+            best_done_slot = i;
+            best_done_ge3 = ge3;
+        }
+    }
+    int chosen = -1;
+    for (unsigned attempt = 0; attempt < BOT_DEPTH_SLOTS; attempt++) {
+        unsigned cand = (g_bot_depth_wr + attempt) & (BOT_DEPTH_SLOTS - 1);
+        if ((int)cand == best_done_slot) continue;
+        uint64_t cf = __atomic_load_n(&g_bot_depth_ring[cand].fence, __ATOMIC_ACQUIRE);
+        if (cf == 0 || (cf != UINT64_MAX && cf <= done)) {
+            chosen = (int)cand;
+            g_bot_depth_wr = cand + 1;
+            break;
+        }
+    }
+    if (chosen < 0) return;
+    unsigned slot = (unsigned)chosen;
+    id<MTLBuffer> dbuf = g_bot_depth_ring[slot].buf;
+    if (!dbuf) {
+        dbuf = [g_dev newBufferWithLength:64 * sizeof(float) options:MTLResourceStorageModeShared];
+        if (!dbuf) return;
+        res_add(dbuf);
+        g_bot_depth_ring[slot].buf = dbuf;
+    }
+    /* Mark slot in-flight with UINT64_MAX before mutating metadata or encoding GPU blits. */
+    __atomic_store_n(&g_bot_depth_ring[slot].fence, UINT64_MAX, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    NSUInteger tw = dtex.width, th = dtex.height;
+    __atomic_store_n(&g_bot_depth_ring[slot].w, (uint32_t)tw, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_bot_depth_ring[slot].h, (uint32_t)th, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_bot_depth_ring[slot].nc, sub_nc, __ATOMIC_RELAXED);
+    id<MTL4ComputeCommandEncoder> e = blit();
+    MTLBlitOption opt = dtex.pixelFormat == MTLPixelFormatDepth32Float_Stencil8
+        ? MTLBlitOptionDepthFromDepthStencil
+        : MTLBlitOptionNone;
+    for (unsigned r = 0; r < 8; r++) {
+        NSUInteger y = ((2u * r + 1u) * th) / 16u;
+        for (unsigned c = 0; c < 8; c++) {
+            NSUInteger x = ((2u * c + 1u) * tw) / 16u;
+            NSUInteger dst_off = (NSUInteger)((r * 8u + c) * sizeof(float));
+            [e copyFromTexture:dtex sourceSlice:0 sourceLevel:0
+                  sourceOrigin:MTLOriginMake(x, y, 0)
+                    sourceSize:MTLSizeMake(1, 1, 1)
+                      toBuffer:dbuf destinationOffset:dst_off
+        destinationBytesPerRow:sizeof(float) destinationBytesPerImage:sizeof(float)
+                       options:opt];
+        }
+    }
+    __atomic_store_n(&g_bot_depth_ring[slot].nc, sub_nc, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_bot_depth_ring[slot].fence, fence, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&g_wb_staged, 1, __ATOMIC_RELAXED);
+}
+
+int mtl_bot_depth_grid(float out_grid[64], uint32_t *out_wb_staged) {
+    if (out_wb_staged) *out_wb_staged = (uint32_t)__atomic_load_n(&g_wb_staged, __ATOMIC_RELAXED);
+    if (!out_grid) return 0;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        uint64_t done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
+        uint64_t best_fence = 0;
+        int best_slot = -1;
+        int best_ge3 = 0;
+        for (int i = 0; i < BOT_DEPTH_SLOTS; i++) {
+            uint64_t f = __atomic_load_n(&g_bot_depth_ring[i].fence, __ATOMIC_ACQUIRE);
+            if (f == 0 || f == UINT64_MAX || f > done) continue;
+            int nc_i = __atomic_load_n(&g_bot_depth_ring[i].nc, __ATOMIC_ACQUIRE);
+            if (nc_i < 1 || g_bot_depth_ring[i].buf == nil) continue;
+            int ge3 = (nc_i >= 3);
+            if (best_slot < 0 || (ge3 > best_ge3) || (ge3 == best_ge3 && f > best_fence)) {
+                best_fence = f;
+                best_slot = i;
+                best_ge3 = ge3;
+            }
+        }
+        if (best_slot < 0) {
+            memset(out_grid, 0, 64 * sizeof(float));
+            return 0;
+        }
+        const void *src = NULL;
+        @autoreleasepool { src = g_bot_depth_ring[best_slot].buf.contents; }
+        if (!src) {
+            memset(out_grid, 0, 64 * sizeof(float));
+            return 0;
+        }
+        memcpy(out_grid, src, 64 * sizeof(float));
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        uint64_t f2 = __atomic_load_n(&g_bot_depth_ring[best_slot].fence, __ATOMIC_ACQUIRE);
+        uint64_t done2 = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
+        if (f2 == best_fence && f2 != UINT64_MAX && f2 <= done2) {
+            return 1;
+        }
+    }
+    memset(out_grid, 0, 64 * sizeof(float));
+    return 0;
+}
+#else
+static inline void botw_depth_stage_encode(uint64_t fence) { (void)fence; }
+int mtl_bot_depth_grid(float out_grid[64], uint32_t *out_wb_staged) {
+    if (out_wb_staged) *out_wb_staged = (uint32_t)__atomic_load_n(&g_wb_staged, __ATOMIC_RELAXED);
+    if (out_grid) memset(out_grid, 0, 64 * sizeof(float));
+    return 0;
+}
+#endif
+
 /* mtl_sub_commit, before the copy encoder closes: this submission's fence is g_fence + 1 */
 void botw_wb_stage_encode(void) {
     uint64_t fence = g_fence + 1;
@@ -17437,9 +17617,10 @@ void botw_wb_stage_encode(void) {
         e = nvn_hm_get(&g_wb, &k);
         if (e && e->stage == stage) e->stage_fence = fence;
         pthread_mutex_unlock(&g_smu);
-        g_wb_staged++;
+        __atomic_fetch_add(&g_wb_staged, 1, __ATOMIC_RELAXED);
     }
     g_wb_nsub = 0;
+    botw_depth_stage_encode(fence);
 }
 static _Atomic int g_wb_staged_skip = -1;
 int botw_wb_staged_skip_on(void) {
@@ -17464,7 +17645,8 @@ int botw_wb_from_stage(void *ev) {
         ok = !nvn_swizzle(&t->d, l, y, src + off, lp, t->mem); off += n; g_wb_bytes += n;
     }
     pthread_mutex_unlock(&g_mu);
-    if (++g_wb_from_stage == 1 || g_wb_from_stage % 5000 == 0) MLOG("[writeback] %llu written back from the submission's own copy (%llu copies staged)", (unsigned long long)g_wb_from_stage, (unsigned long long)g_wb_staged);
+    uint64_t staged = __atomic_load_n(&g_wb_staged, __ATOMIC_RELAXED);
+    if (++g_wb_from_stage == 1 || g_wb_from_stage % 5000 == 0) MLOG("[writeback] %llu written back from the submission's own copy (%llu copies staged)", (unsigned long long)g_wb_from_stage, (unsigned long long)staged);
     return ok;
 }
 /* Sinking legs (2026-10-23): the game composes the terrain height clipmap on the GPU, one NVN texture object to render
@@ -17531,6 +17713,12 @@ int botw_wb_newer(const void *mem, uint64_t gen) {
     uint64_t k = (uint64_t)(uintptr_t)mem;
     pthread_mutex_lock(&g_bwb_mu); uint64_t g = (uint64_t)(uintptr_t)nvn_hm_get(&g_bwb_at, &k); pthread_mutex_unlock(&g_bwb_mu);
     return g > gen;
+}
+#else
+int mtl_bot_depth_grid(float out_grid[64], uint32_t *out_wb_staged) {
+    if (out_wb_staged) *out_wb_staged = 0;
+    if (out_grid) memset(out_grid, 0, 64 * sizeof(float));
+    return 0;
 }
 #endif
 
