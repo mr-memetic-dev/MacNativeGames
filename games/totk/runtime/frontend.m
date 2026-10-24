@@ -146,10 +146,19 @@ void runtime_warm_done(void){
  dispatch_async(dispatch_get_main_queue(), ^{if(atomic_load(&presentedFrames))boot_overlay_hide();});
 }
 uint64_t front_game_res(int docked){(void)docked;return (720ULL<<32)|1280;}
-/* TOTK_ASSUME_FOCUS=1: unattended test runs. macOS refuses to activate an app launched from the background while the user is working in
-   another one; the window then never becomes key, GetCurrentFocusState stays 0 and the game waits before its first frame. In this mode the
-   game is told it is focused, and the window is shown without taking the keyboard from the user (scripted input does not need it). */
-static int assume_focus(void){static int v=-1;if(v<0){const char *e=getenv("TOTK_ASSUME_FOCUS");v=e&&atoi(e);}return v;}
+/* TOTK_ASSUME_FOCUS=1 (or TOTK_BOT_SMOKE=1 / TOTK_MINIMIZE=1 / TOTK_HEADLESS=1): unattended test runs. macOS refuses to activate an app
+   launched from the background while the user is working in another one; the window then never becomes key, GetCurrentFocusState stays 0
+   and the game waits before its first frame. In this mode the game is told it is focused, and the window never takes the keyboard from
+   the user (scripted/bot input does not need it). */
+static int bot_smoke_bg_mode(void){
+ static int v=-1;
+ if(v<0){
+  const char *s=getenv("TOTK_BOT_SMOKE"),*m=getenv("TOTK_MINIMIZE"),*h=getenv("TOTK_HEADLESS");
+  v=((s&&!strcmp(s,"1"))||(m&&atoi(m))||(h&&atoi(h)))?1:0;
+ }
+ return v;
+}
+static int assume_focus(void){static int v=-1;if(v<0){const char *e=getenv("TOTK_ASSUME_FOCUS");v=(e&&atoi(e))||bot_smoke_bg_mode();}return v;}
 /* Keep the guest active when the macOS window loses key status. Native input is still cleared
    in windowDidResignKey so a held key cannot remain stuck while another app has focus. */
 int runtime_front_focus(void){return 1;}
@@ -463,7 +472,7 @@ void runtime_front_resize_aspect(double ratio){
 @end
 @implementation TOTKWindowDelegate
 -(void)windowDidBecomeKey:(NSNotification *)n{(void)n;front_playtime_tick(NO);atomic_store(&focused,1);if(window.styleMask&NSWindowStyleMaskFullScreen)[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:YES];runtime_oe_push_message(15);front_mouse_update();fprintf(stderr,"[totk] window gained focus\n");front_sr_window();}
--(void)windowDidResignKey:(NSNotification *)n{(void)n;front_playtime_tick(YES);atomic_store(&focused,0);[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:NO];front_mouse_update();runtime_input_clear();runtime_oe_push_message(15);fprintf(stderr,"[totk] window lost focus\n");front_sr_window();}
+-(void)windowDidResignKey:(NSNotification *)n{(void)n;front_playtime_tick(YES);atomic_store(&focused,0);[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:NO];front_mouse_update();if(!assume_focus())runtime_input_clear();runtime_oe_push_message(15);fprintf(stderr,"[totk] window lost focus\n");front_sr_window();}
 /* The process ends with the window. Save writes go straight to the files (runtime/fs_host.c), so a close in the middle of a
    save waits (up to 15 s, the window already gone) until the game has written and committed it (runtime_fs_save_busy). */
 -(void)windowWillClose:(NSNotification *)n{(void)n;front_playtime_tick(YES);
@@ -484,15 +493,17 @@ void runtime_front_resize_aspect(double ratio){
    fully covered window, so presents stop and per-picture measurements of that stretch are void; a test session's log
    says when (the user working in other apps covered the test windows of the frame interpolation tests). */
 static _Atomic int windowVisible=-1;   /* -1 not known yet; read by the present path's stall lines (runtime_front_window_visible) */
-static void note_occlusion(const char *when){int v=(window.occlusionState&NSWindowOcclusionStateVisible)!=0;atomic_store(&windowVisible,v);
+static void note_occlusion(const char *when){int v=!window.isMiniaturized&&(window.occlusionState&NSWindowOcclusionStateVisible)!=0;atomic_store(&windowVisible,v);
  fprintf(stderr,"[totk] window %s%s (frame %llu)\n",v?"visible":"covered (or on another Space): no presents until it is visible again",when,(unsigned long long)dm_nvn_frame_count());
  front_sr_window();}
 -(void)windowDidChangeOcclusionState:(NSNotification *)n{(void)n;note_occlusion("");}
+-(void)windowDidMiniaturize:(NSNotification *)n{(void)n;atomic_store(&windowVisible,0);fprintf(stderr,"[totk] window minimized (frame %llu)\n",(unsigned long long)dm_nvn_frame_count());}
+-(void)windowDidDeminiaturize:(NSNotification *)n{(void)n;note_occlusion(" after deminiaturize");}
 -(void)windowDidChangeBackingProperties:(NSNotification *)n{(void)n;front_sync_drawable();}
 @end
 static TOTKWindowDelegate *windowDelegate;
 int runtime_front_window_visible(void){return atomic_load(&windowVisible);}
-void runtime_front_request_close(void){dispatch_async(dispatch_get_main_queue(), ^{[window performClose:nil];});}
+void runtime_front_request_close(void){dispatch_async(dispatch_get_main_queue(), ^{if(window.isVisible&&!window.isMiniaturized)[window performClose:nil];else[window close];});}
 /* Use the window-close path, not terminate:, so Command-Q also waits for active saves. */
 static void front_install_menu(void){
  NSMenu *menu=[NSMenu new],*appMenu=[NSMenu new];
@@ -512,7 +523,13 @@ void runtime_front_run(void(*callback)(void)){
 #else
   if(totk_sr_start)totk_sr_start("totk",TOTK_GAME_VERSION);
 #endif
-  [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+  [NSUserDefaults.standardUserDefaults registerDefaults:@{@"ApplePersistenceIgnoreState": @YES}];
+  [NSApplication sharedApplication];
+  const char *showEnv=getenv("TOTK_SHOW_WINDOW"),*minEnv=getenv("TOTK_MINIMIZE"),*hlEnv=getenv("TOTK_HEADLESS");
+  int showWin=showEnv&&!strcmp(showEnv,"1"),wantMin=minEnv&&atoi(minEnv),wantBg=(hlEnv&&atoi(hlEnv))||(bot_smoke_bg_mode()&&!showWin&&!wantMin);
+  [NSApp setActivationPolicy:wantBg?NSApplicationActivationPolicyAccessory:NSApplicationActivationPolicyRegular];
+  static id<NSObject> bgActivityToken;
+  if(assume_focus()){bgActivityToken=[[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated|NSActivityLatencyCritical reason:@"Unattended smoke test / background execution"];(void)bgActivityToken;}
   runtime_mouse_set_hook(front_mouse_update);
   runtime_gamepad_start();
   /* Default window: the docked output size, 1920x1080, scaled down (16:9 kept) when the screen's visible area is smaller. */
@@ -521,7 +538,7 @@ void runtime_front_run(void(*callback)(void)){
   {const char *e=getenv("TOTK_WINDOW_SIZE");int w=0,h=0;if(e&&sscanf(e,"%dx%d",&w,&h)==2&&w>=320&&h>=180&&w<=8192&&h<=8192){ww=w;wh=h;}}
   CGFloat k=fmin(1,fmin(vis.size.width/ww,(vis.size.height-28)/wh));ww=floor(ww*k);wh=floor(wh*k);
   window=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,ww,wh) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskResizable backing:NSBackingStoreBuffered defer:NO];
-  window.releasedWhenClosed=NO;   /* a close that waits for a save (windowWillClose) must not free the window the static pointer still holds */
+  window.releasedWhenClosed=NO;window.restorable=NO;   /* a close that waits for a save (windowWillClose) must not free the window the static pointer still holds */
   /* An agent's test game (TOTK_SLOT_OWNER other than user) says so in its title: it plays a save copy and its script closes it. */
   const char *owner=getenv("TOTK_SLOT_OWNER"),*purpose=getenv("TOTK_SLOT_PURPOSE");
   window.title=owner&&*owner&&strcmp(owner,"user")?[NSString stringWithFormat:@(TOTK_UI("测试局（%s）Ver. %s：%s — 存档副本，进度不会存进你的存档，脚本会自己关闭","Test session (%s) Ver. %s: %s — save copy, progress is not saved to your save, the script closes it")),owner,TOTK_GAME_VERSION,purpose&&*purpose?purpose:TOTK_UI("代理测试","agent test")]:[NSString stringWithFormat:@GAME_NAME "  Mac — Ver. %s",TOTK_GAME_VERSION];
@@ -555,10 +572,14 @@ void runtime_front_run(void(*callback)(void)){
   {char word[16];if(runtime_setting_word("fps-graph.txt",word,sizeof word))fpsGraphEnabled=!strncmp(word,"on",2);}
   TOTKFpsGraph *graph=[[TOTKFpsGraph alloc] initWithFrame:NSZeroRect];[box addSubview:graph];fpsGraphBox=graph;[graph setEnabled:fpsGraphEnabled];[box refresh];
   [window makeFirstResponder:window.contentView];[window center];front_sync_drawable();
-  if(assume_focus()){[window orderFrontRegardless];}else{[window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}   /* in front of other apps' windows, keyboard left alone */
+  if(assume_focus()){
+   if(wantBg){[window orderOut:nil];atomic_store(&windowVisible,0);fprintf(stderr,"[totk] smoke/background mode: window ordered out (headless background)\n");}
+   else if(wantMin){[window orderBack:nil];[window miniaturize:nil];atomic_store(&windowVisible,0);fprintf(stderr,"[totk] smoke/background mode: window minimized\n");}
+   else{[window orderFrontRegardless];}
+  }else{[window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}   /* in front of other apps' windows, keyboard left alone */
   front_sr_view();
   [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n){(void)n;front_sr_view();}];   /* a refresh rate changed on the same screen */
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC),dispatch_get_main_queue(),^{note_occlusion(" 3 s after opening");});
+  if(!wantBg&&!wantMin)dispatch_after(dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC),dispatch_get_main_queue(),^{note_occlusion(" 3 s after opening");});
   atomic_store(&focused,1);
   if(CVDisplayLinkCreateWithActiveCGDisplays(&displayLink)||CVDisplayLinkSetOutputCallback(displayLink,vsync_callback,NULL)||CVDisplayLinkStart(displayLink))runtime_fail("native display link initialization");
   pthread_t guest;pthread_attr_t attr;pthread_attr_init(&attr);pthread_attr_setstacksize(&attr,8*1024*1024);int err=pthread_create(&guest,&attr,guest_main,(void *)callback);pthread_attr_destroy(&attr);if(err)runtime_fail("native game thread creation");
