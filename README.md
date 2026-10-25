@@ -1,4 +1,53 @@
-# MacNativeGames
+# MacNativeGames — BotW 1.9.0 Rust Bot & Sensor Fork
+
+This fork extends [`ly05010419/MacNativeGames`](https://github.com/ly05010419/MacNativeGames) with a zero-stall **C + Rust (`libbotw_bot.a`) telemetry, sensor, and automated smoke-test / bot control architecture** for **The Legend of Zelda: Breath of the Wild 1.9.0** (`GAME_BOTW190`) on Apple silicon macOS.
+
+Full technical specification, FFI memory layout, and JSONL telemetry schema: **[`games/totk/bot_engine/README.md`](games/totk/bot_engine/README.md)**.
+
+## Fork Additions (`games/totk/bot_engine`)
+
+1. **Weak-Linked C ↔ Rust FastHands FFI Seam (`games/totk/runtime/bot_ffi.h`, `build/libbotw_bot.a`)**
+   - Fixed-size, cache-aligned `SchematicState` (`656` bytes, C → Rust) and `BotFrameCommand` (`296` bytes, Rust → C) verified at compile time on both sides (`_Static_assert` and Rust `const _: () = assert!(...)`).
+   - Weak-linked (`__attribute__((weak_import))`) into `totk-native-botw190` so standard builds without `libbotw_bot.a` continue to link and run unchanged.
+
+2. **Zero-Stall `8×8` Metal G-Buffer Depth Grid (`nvn_mtl.m`)**
+   - `BOTW_DEPTH_NOTE(pd)` identifies the primary 16:9 3D scene G-buffer depth pass (`Depth32Float` / `Depth32Float_Stencil8`).
+   - At submission commit (`botw_depth_stage_encode`), a single `MTLBlitCommandEncoder` copies 64 evenly-spaced `1×1` depth samples into an 8-slot `MTLResourceStorageModeShared` ring buffer tagged with `g_fence + 1`.
+   - `mtl_bot_depth_grid` reads the newest GPU-completed slot (`fence <= g_done`) with **0.0 ms CPU/GPU wait** and linearizes hardware depth into metric `TerrainClearance` (`front_clear_m`, `left_clear_m`, `right_clear_m`, `ground_ahead_m`, `cliff_drop_ahead`).
+
+3. **Crash-Safe Guest Memory & `BaseProcMgr` Nearby Actors Sensor (`world_survey.c`)**
+   - Uses `mach_vm_read_overwrite` (`read_mem_190`) to read `VFR` (`main + 0x1e93890`), the active camera (`main + 0x1e39d10`), `uking::PlayerMgr::sInstance` (`main + 0x1e13ed0`, Link world matrix at `BaseProc + 0x398`), and `ksys::act::BaseProcMgr::sInstance` (`main + 0x1e937f8`).
+   - Traverses up to 512 active actor nodes in the `BaseProcMgr` red-black tree and populates `SchematicState.actors[0..8]` with the 8 nearest actors sorted by 3D Euclidean distance (`name_hash`, `flags`, `pos`, `vel`, `dist_m`).
+
+4. **Headless / Background / Minimized Smoke-Test Harness (`DeterministicSmokePolicy`)**
+   - Runs end-to-end (`wait_for_world` → `settle_baseline` → `walk_forward` → `camera_pan_sprint` → `jump_and_turn` → `settle_after` → `done`) in ~30 s at ~119 FPS without stealing focus (`TOTK_BOT_SMOKE=1`, `TOTK_MINIMIZE=1`, `TOTK_HEADLESS=1`).
+   - Bypasses `CAMetalDisplayLink` / `nextDrawable` when the window is hidden or minimized and prevents macOS App Nap via `NSActivityUserInitiated | NSActivityLatencyCritical`.
+   - Non-blocking background worker thread (`botw-bot-io`) over a bounded `sync_channel(256)` (`try_send`) writes `[bot_engine]` heartbeats, `TOTK_BOT_TRACE` JSONL trajectories, and atomic phase-transition PNG screenshots (`dm_gfx_ashot`).
+
+5. **Runtime & Input Enhancements**
+   - Synthetic gamepad state injection (`runtime_input_pad_synthetic`, preserved across window focus loss) and `pad` / `padclear` commands in `TOTK_INPUT_FILE`.
+   - BotW 1.9.0 DLC title-screen support for `TOTK_AUTOLOAD=1`, atomic `ashot` PNG writes, and `1 MiB` write-back texture staging (`WB_STAGE_MAX`).
+
+### Quick Start (BotW 1.9.0 Rust Adapter)
+
+```sh
+# 1. Run Rust unit tests (ABI layout, depth linearization, smoke policy, async JSONL logger)
+cargo test --manifest-path games/totk/bot_engine/Cargo.toml
+
+# 2. Build libbotw_bot.a + Breath of the Wild 1.9.0 runtime (macOS arm64)
+make -C games/totk bot-engine runtime-botw190
+
+# 3. Run an automated headless background smoke test (does not steal window focus)
+TOTK_SLOT_OWNER=agent \
+TOTK_AUTOLOAD=1 \
+TOTK_BOT_SMOKE=1 \
+TOTK_BOT_ASHOT_DIR=/tmp/botw_bot_smoke \
+TOTK_BOT_TRACE=/tmp/botw_bot_smoke/bot_trace.jsonl \
+"/path/to/Breath of the Wild.app/Contents/MacOS/BotW"
+```
+
+---
+
 
 <p align="center"><img src="docs/images/botw-ultrawide-mac.png" width="100%"></p>
 
