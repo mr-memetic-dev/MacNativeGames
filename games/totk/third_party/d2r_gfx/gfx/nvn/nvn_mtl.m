@@ -16937,14 +16937,23 @@ static void ashot_take(id<MTLTexture> src, const char *path, long frame) { @auto
         CGContextRef small = img ? CGBitmapContextCreate(NULL, ow, oh, 8, 0, cs, kCGImageAlphaNoneSkipLast) : NULL;
         CGImageRef out = NULL;
         if (small) { CGContextSetInterpolationQuality(small, kCGInterpolationMedium); CGContextDrawImage(small, CGRectMake(0, 0, ow, oh), img); out = CGBitmapContextCreateImage(small); }
+        uid_t euid = geteuid();
+        struct stat st;
+        int path_safe = (lstat(p, &st) != 0 && errno == ENOENT) || (S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode) && st.st_uid == euid);
         static _Atomic unsigned ashot_seq;
         unsigned seq = atomic_fetch_add_explicit(&ashot_seq, 1u, memory_order_relaxed);
         char tmp[1056]; snprintf(tmp, sizeof tmp, "%s.%ld.%u.tmp", p, frame, seq);   /* pollers never see a half-written PNG at p */
-        CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)tmp, (CFIndex)strlen(tmp), false);
+        if (path_safe && lstat(tmp, &st) == 0) path_safe = 0;
+        CFURLRef url = path_safe ? CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)tmp, (CFIndex)strlen(tmp), false) : NULL;
         CGImageDestinationRef dst = url && out ? CGImageDestinationCreateWithURL(url, (__bridge CFStringRef)UTTypePNG.identifier, 1, NULL) : NULL;
         int ok = 0;
         if (dst) { CGImageDestinationAddImage(dst, out, NULL); ok = CGImageDestinationFinalize(dst); CFRelease(dst); }
         if (url) CFRelease(url);
+        if (ok) {
+            if (lstat(tmp, &st) != 0 || !S_ISREG(st.st_mode) || S_ISLNK(st.st_mode) || st.st_uid != euid) ok = 0;
+            else (void)chmod(tmp, 0600);
+        }
+        if (ok && lstat(p, &st) == 0 && (!S_ISREG(st.st_mode) || S_ISLNK(st.st_mode) || st.st_uid != euid)) ok = 0;
         if (ok && rename(tmp, p) != 0) ok = 0;
         if (!ok) unlink(tmp);
         CGImageRelease(out); CGContextRelease(small); CGImageRelease(img); if (dp) CGDataProviderRelease(dp); CGColorSpaceRelease(cs);

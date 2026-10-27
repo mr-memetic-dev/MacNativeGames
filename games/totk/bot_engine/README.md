@@ -39,8 +39,8 @@ The connector spans three components linked into `build/runtime-botw190`:
 | `TOTK_MINIMIZE` | `0` or `1` | Starts the game window minimized in the Dock (`[window miniaturize:nil]`) with `CAMetalDisplayLink`/`nextDrawable` bypassed so offscreen rendering, depth readback, and `ashot` PNG captures run at full speed. |
 | `TOTK_HEADLESS` | `0` or `1` | Keeps the window ordered out (`[window orderOut:nil]`) as an accessory background process with `CAMetalDisplayLink`/`nextDrawable` bypassed. |
 | `TOTK_BOT_EXIT_ON_DONE` | `0` or `1` | When `1`, `DeterministicSmokePolicy` sets `cmd.request_close = 1` 30 frames after reaching `SmokePhase::Done` for automated headless/windowed test runs. |
-| `TOTK_BOT_ASHOT_DIR` | Path (default `/tmp`) | Directory where `DeterministicSmokePolicy` saves phase-transition PNG screenshots (`bot_smoke_<phase>_<frame>.png`) via `dm_gfx_ashot`. |
-| `TOTK_BOT_TRACE` | File path (e.g. `/tmp/bot_trace.jsonl`) | Appends one JSONL transition record per frame containing `z_t`, `a_t`, `z_next`, `clearance` (derived from `depth_grid`), `actor_count`, and `nearby_actors`. |
+| `TOTK_BOT_ASHOT_DIR` | Path (default `$HOME/Library/Logs/MacNativeGames/botw_bot_smoke` on macOS) | Directory where `DeterministicSmokePolicy` saves phase-transition PNG screenshots (`bot_smoke_<phase>_<frame>.png`) via `dm_gfx_ashot`. Validated with `lstat` (non-symlink, owned by `geteuid()`, mode `0700`); `/tmp/...` may still be passed explicitly if it passes validation. |
+| `TOTK_BOT_TRACE` | File path (default `<TOTK_BOT_ASHOT_DIR>/bot_trace.jsonl`) | Writes RFC 8259 JSONL telemetry records (`NaN`/`Inf`-sanitized) opened with `O_NOFOLLOW` and mode `0600` inside a validated `0700` parent directory. |
 | `TOTK_AUTOLOAD` | `0` or `1` | Automatically advances past the BotW title screen into the most recent save slot (`games/totk/runtime/stubs.c`). |
 | `TOTK_SAVE_DIR` | Directory path | Overrides the BotW save directory (`nand/user/save/...`). |
 | `TOTK_INPUT_FILE` | File path (e.g. `/tmp/botw_input.cmd`) | Polled live command file supporting `pad <buttons_hex> <lx> <ly> <rx> <ry>`, `padclear`, `ashot <path>`, `survey ...`, and `quit`. |

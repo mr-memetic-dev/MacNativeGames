@@ -22,7 +22,7 @@ Full technical specification, FFI memory layout, and JSONL telemetry schema: **[
 4. **Headless / Background / Minimized Smoke-Test Harness (`DeterministicSmokePolicy`)**
    - Runs end-to-end (`wait_for_world` → `settle_baseline` → `walk_forward` → `camera_pan_sprint` → `jump_and_turn` → `settle_after` → `done`) in ~30 s at ~119 FPS without stealing focus (`TOTK_BOT_SMOKE=1`, `TOTK_MINIMIZE=1`, `TOTK_HEADLESS=1`).
    - Bypasses `CAMetalDisplayLink` / `nextDrawable` when the window is hidden or minimized and prevents macOS App Nap via `NSActivityUserInitiated | NSActivityLatencyCritical`.
-   - Non-blocking background worker thread (`botw-bot-io`) over a bounded `sync_channel(256)` (`try_send`) writes `[bot_engine]` heartbeats, `TOTK_BOT_TRACE` JSONL trajectories, and atomic phase-transition PNG screenshots (`dm_gfx_ashot`).
+   - Non-blocking background worker thread (`botw-bot-io`) over a bounded `sync_channel(512)` (`try_send`) writes `[bot_engine]` heartbeats, RFC 8259 `TOTK_BOT_TRACE` JSONL trajectories (`O_NOFOLLOW`, `0600`), and atomic phase-transition PNG screenshots (`dm_gfx_ashot`, default `$HOME/Library/Logs/MacNativeGames/botw_bot_smoke`, mode `0700`).
 
 5. **Runtime & Input Enhancements**
    - Synthetic gamepad state injection (`runtime_input_pad_synthetic`, preserved across window focus loss) and `pad` / `padclear` commands in `TOTK_INPUT_FILE`.

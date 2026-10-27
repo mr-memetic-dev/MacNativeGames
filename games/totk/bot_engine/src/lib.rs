@@ -4,17 +4,39 @@
 //! matching `games/totk/runtime/bot_ffi.h` (`BOT_ABI_VERSION = 1`).
 
 pub mod ffi;
-mod logger;
+pub mod logger;
 
 pub use ffi::*;
-use logger::{BotAsyncEvent, BotAsyncLogger};
+use logger::{
+    current_euid, ensure_secure_dir, BotAsyncEvent, BotAsyncLogger,
+};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Latches to `true` if `bot_on_frame_tick` ever catches a panic so subsequent frames return immediately.
 static BOT_PANICKED: AtomicBool = AtomicBool::new(false);
+
+/// Resolves the default user-private directory for smoke-test screenshots and JSONL traces
+/// outside shared `/tmp` (`$HOME/Library/Logs/MacNativeGames/botw_bot_smoke` on macOS,
+/// `$HOME/.local/state/macnativegames/botw_bot_smoke` on other Unix systems).
+pub fn default_ashot_dir() -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        let trimmed = home.trim_end_matches('/');
+        if !trimmed.is_empty() {
+            #[cfg(target_os = "macos")]
+            {
+                return format!("{}/Library/Logs/MacNativeGames/botw_bot_smoke", trimmed);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                return format!("{}/.local/state/macnativegames/botw_bot_smoke", trimmed);
+            }
+        }
+    }
+    format!("/tmp/botw_bot_smoke_{}", current_euid())
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SmokePhase {
@@ -44,6 +66,7 @@ impl SmokePhase {
 pub struct BotRuntime {
     pub enabled: bool,
     pub exit_on_complete: bool,
+    pub ashot_enabled: bool,
     pub phase: SmokePhase,
     pub world_ready_streak: u32,
     pub start_pos: Option<BotVec3>,
@@ -65,6 +88,7 @@ impl BotRuntime {
         Self {
             enabled,
             exit_on_complete,
+            ashot_enabled: take > 0,
             phase: SmokePhase::WaitForWorld,
             world_ready_streak: 0,
             start_pos: None,
@@ -86,14 +110,24 @@ impl BotRuntime {
             .or_else(|_| std::env::var("TOTK_BOT_EXIT_ON_DONE"))
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
-        let ashot_dir =
-            std::env::var("TOTK_BOT_ASHOT_DIR").unwrap_or_else(|_| "/tmp/botw_bot_smoke".to_string());
-        let trace_path = std::env::var("TOTK_BOT_TRACE").unwrap_or_else(|_| {
-            format!("{}/bot_trace.jsonl", ashot_dir.trim_end_matches('/'))
-        });
+        let ashot_dir = std::env::var("TOTK_BOT_ASHOT_DIR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(default_ashot_dir);
+        let trace_path = std::env::var("TOTK_BOT_TRACE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("{}/bot_trace.jsonl", ashot_dir.trim_end_matches('/')));
 
         let mut rt = Self::new_for_test(enabled, exit_on_complete, &ashot_dir);
         if enabled {
+            if let Err(e) = ensure_secure_dir(Path::new(&ashot_dir)) {
+                eprintln!(
+                    "[bot_engine] WARNING: disabling ashot capture; insecure ashot_dir '{}': {}",
+                    ashot_dir, e
+                );
+                rt.ashot_enabled = false;
+            }
             let logger = BotAsyncLogger::spawn(PathBuf::from(&trace_path));
             logger.send(BotAsyncEvent::Banner {
                 ashot_dir,
@@ -107,10 +141,13 @@ impl BotRuntime {
 
     #[inline]
     fn ashot_dir_str(&self) -> &str {
-        core::str::from_utf8(&self.ashot_dir_bytes[..self.ashot_dir_len]).unwrap_or("/tmp")
+        core::str::from_utf8(&self.ashot_dir_bytes[..self.ashot_dir_len]).unwrap_or("")
     }
 
     fn trigger_ashot(&mut self, cmd: &mut BotFrameCommand, tag: &str, frame_index: u64) {
+        if !self.ashot_enabled || self.ashot_dir_len == 0 {
+            return;
+        }
         let id = self.next_ashot_id;
         self.next_ashot_id = self.next_ashot_id.saturating_add(1);
         cmd.request_ashot_id = id;
@@ -383,6 +420,7 @@ pub unsafe extern "C" fn bot_on_frame_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logger::{json_f32, open_secure_trace_file, write_frame_telemetry_json};
     use std::mem::{offset_of, size_of};
 
     #[test]
@@ -540,5 +578,116 @@ mod tests {
         }
         assert_eq!(cmd.pad_connected, 0);
         assert_eq!(cmd.buttons, 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn secure_dir_and_nofollow_trace_reject_symlinks() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+
+        let base = std::env::temp_dir().join(format!(
+            "botw_bot_sec_test_{}_{}",
+            std::process::id(),
+            current_euid()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // 1. ensure_secure_dir creates a 0700 directory owned by current_euid().
+        let secure_sub = base.join("smoke_dir");
+        ensure_secure_dir(&secure_sub).expect("ensure_secure_dir should create 0700 dir");
+        let meta = std::fs::symlink_metadata(&secure_sub).expect("symlink_metadata");
+        assert!(meta.is_dir());
+        assert!(!meta.file_type().is_symlink());
+        assert_eq!(meta.uid(), current_euid());
+        assert_eq!(meta.mode() & 0o777, 0o700);
+
+        // 2. ensure_secure_dir rejects a symlink directory.
+        let target_dir = base.join("real_target_dir");
+        std::fs::create_dir_all(&target_dir).expect("create target_dir");
+        let symlink_dir = base.join("symlink_dir");
+        symlink(&target_dir, &symlink_dir).expect("create dir symlink");
+        assert!(
+            ensure_secure_dir(&symlink_dir).is_err(),
+            "ensure_secure_dir must reject symlinked directories"
+        );
+
+        // 3. open_secure_trace_file creates a 0600 file and rejects writing through a symlink.
+        let valid_trace = secure_sub.join("bot_trace.jsonl");
+        {
+            let f = open_secure_trace_file(&valid_trace).expect("open valid trace file");
+            let fmeta = f.metadata().expect("trace metadata");
+            assert_eq!(fmeta.mode() & 0o777, 0o600);
+        }
+
+        let victim_file = base.join("victim.txt");
+        std::fs::write(&victim_file, b"keep_safe").expect("write victim");
+        let symlink_trace = secure_sub.join("symlink_trace.jsonl");
+        symlink(&victim_file, &symlink_trace).expect("create trace symlink");
+        assert!(
+            open_secure_trace_file(&symlink_trace).is_err(),
+            "open_secure_trace_file must reject symlink trace path via lstat + O_NOFOLLOW"
+        );
+        assert_eq!(
+            std::fs::read(&victim_file).expect("read victim"),
+            b"keep_safe",
+            "victim file must not be truncated or overwritten"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn json_f32_sanitizes_nan_and_infinity_in_jsonl() {
+        assert_eq!(json_f32(1.25), 1.25);
+        assert_eq!(json_f32(f32::NAN), 0.0);
+        assert_eq!(json_f32(f32::INFINITY), 0.0);
+        assert_eq!(json_f32(f32::NEG_INFINITY), 0.0);
+
+        let mut buf = Vec::new();
+        let nan_vec = BotVec3 {
+            x: f32::NAN,
+            y: f32::INFINITY,
+            z: f32::NEG_INFINITY,
+        };
+        let nan_clr = BotClearanceSummary {
+            depth_valid: true,
+            valid_cells: 64,
+            cam_to_player_m: f32::NAN,
+            front_clear_m: f32::NAN,
+            left_clear_m: f32::INFINITY,
+            right_clear_m: f32::NEG_INFINITY,
+            ground_ahead_m: f32::NAN,
+            nearest_actor_dist_m: f32::INFINITY,
+            nearest_actor_hash: 0xdeadbeef,
+        };
+        write_frame_telemetry_json(
+            &mut buf,
+            42,
+            1000,
+            f32::NAN,
+            15,
+            900,
+            12,
+            "walk_forward",
+            nan_vec,
+            nan_vec,
+            nan_vec,
+            nan_clr,
+            3,
+            0,
+            0,
+            30000,
+            0,
+            0,
+            0,
+        )
+        .expect("write_frame_telemetry_json");
+
+        let line = String::from_utf8(buf).expect("valid utf8");
+        assert!(!line.contains("NaN"), "JSONL must not contain NaN: {}", line);
+        assert!(!line.contains("inf"), "JSONL must not contain inf: {}", line);
+        assert!(!line.contains("Inf"), "JSONL must not contain Inf: {}", line);
+        assert!(line.contains("\"dt_s\":0.00000"));
+        assert!(line.contains("\"player\":[0.000,0.000,0.000]"));
     }
 }
